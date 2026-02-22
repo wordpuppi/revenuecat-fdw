@@ -1,0 +1,70 @@
+name: Build and Release WASM FDW
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          source "$HOME/.cargo/env"
+          rustup target add wasm32-unknown-unknown
+
+      - name: Install cargo-component
+        shell: bash
+        run: |
+          source "$HOME/.cargo/env"
+          cargo install cargo-component
+
+      - name: Build WASM binary
+        shell: bash
+        run: |
+          source "$HOME/.cargo/env"
+          cargo component build --release --target wasm32-unknown-unknown
+
+      - name: Generate checksum
+        shell: bash
+        run: |
+          WASM_FILE="target/wasm32-unknown-unknown/release/revenuecat_fdw.wasm"
+          sha256sum "$WASM_FILE" > "${WASM_FILE}.sha256"
+          echo "SHA256 checksum:"
+          cat "${WASM_FILE}.sha256"
+
+      - name: Create release
+        shell: bash
+        env:
+          TAG: ${{ gitea.ref_name }}
+        run: |
+          WASM_FILE="target/wasm32-unknown-unknown/release/revenuecat_fdw.wasm"
+          CHECKSUM_FILE="${WASM_FILE}.sha256"
+
+          # Create release via Gitea API
+          RELEASE_RESP=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ gitea.server_url }}/api/v1/repos/${{ gitea.repository }}/releases" \
+            -d "{\"tag_name\": \"${TAG}\", \"name\": \"${TAG}\", \"body\": \"RevenueCat WASM FDW ${TAG}\"}")
+
+          RELEASE_ID=$(echo "$RELEASE_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+          # Upload .wasm artifact
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" \
+            -F "attachment=@${WASM_FILE}" \
+            "${{ gitea.server_url }}/api/v1/repos/${{ gitea.repository }}/releases/${RELEASE_ID}/assets?name=revenuecat_fdw.wasm"
+
+          # Upload checksum
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" \
+            -F "attachment=@${CHECKSUM_FILE}" \
+            "${{ gitea.server_url }}/api/v1/repos/${{ gitea.repository }}/releases/${RELEASE_ID}/assets?name=revenuecat_fdw.wasm.sha256"
