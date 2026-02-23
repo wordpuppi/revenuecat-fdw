@@ -11,6 +11,7 @@ use bindings::{
     },
 };
 
+
 #[derive(Debug, Default)]
 struct RevenueCatFdw {
     base_url: String,
@@ -366,70 +367,19 @@ impl Guest for RevenueCatFdw {
     fn insert(_ctx: &Context, row: &Row) -> FdwResult {
         let this = Self::this_mut();
 
-        match this.object.as_str() {
-            "customers" => {
-                // POST /v2/projects/{pid}/customers
-                // Body: { "id": "...", "attributes": [...] }
+        let (url, body) = match this.object.as_str() {
+            "customers" | "entitlements" | "offerings" => {
                 let url = format!(
-                    "{}/projects/{}/customers",
-                    this.base_url, this.project_id
+                    "{}/projects/{}/{}",
+                    this.base_url, this.project_id, this.object
                 );
                 let body = this.row_to_body(row)?;
-                let req = http::Request {
-                    method: http::Method::Post,
-                    url,
-                    headers: this.headers.clone(),
-                    body,
-                };
-                let resp = http::post(&req)?;
-                http::error_for_status(&resp)
-                    .map_err(|err| format!("{}: {}", err, resp.body))?;
-                stats::inc_stats(FDW_NAME, stats::Metric::RowsOut, 1);
-            }
-            "entitlements" => {
-                // POST /v2/projects/{pid}/entitlements
-                // Body: { "lookup_key": "...", "display_name": "..." }
-                let url = format!(
-                    "{}/projects/{}/entitlements",
-                    this.base_url, this.project_id
-                );
-                let body = this.row_to_body(row)?;
-                let req = http::Request {
-                    method: http::Method::Post,
-                    url,
-                    headers: this.headers.clone(),
-                    body,
-                };
-                let resp = http::post(&req)?;
-                http::error_for_status(&resp)
-                    .map_err(|err| format!("{}: {}", err, resp.body))?;
-                stats::inc_stats(FDW_NAME, stats::Metric::RowsOut, 1);
-            }
-            "offerings" => {
-                // POST /v2/projects/{pid}/offerings
-                let url = format!(
-                    "{}/projects/{}/offerings",
-                    this.base_url, this.project_id
-                );
-                let body = this.row_to_body(row)?;
-                let req = http::Request {
-                    method: http::Method::Post,
-                    url,
-                    headers: this.headers.clone(),
-                    body,
-                };
-                let resp = http::post(&req)?;
-                http::error_for_status(&resp)
-                    .map_err(|err| format!("{}: {}", err, resp.body))?;
-                stats::inc_stats(FDW_NAME, stats::Metric::RowsOut, 1);
+                (url, body)
             }
             "granted_entitlements" => {
-                // Grant entitlement to a customer
-                // POST /v2/projects/{pid}/customers/{cid}/actions/grant_entitlement
-                // Body: { "entitlement_id": "...", "expires_at": ... }
+                // Extract customer_id and entitlement_id from the row
                 let cols = row.cols();
                 let cells = row.cells();
-
                 let customer_id = cols
                     .iter()
                     .zip(cells.iter())
@@ -438,8 +388,7 @@ impl Guest for RevenueCatFdw {
                         Some(Cell::String(s)) => Some(s.clone()),
                         _ => None,
                     })
-                    .ok_or("'customer_id' column is required for granted_entitlements INSERT")?;
-
+                    .ok_or_else(|| "customer_id is required for granted_entitlements insert".to_owned())?;
                 let entitlement_id = cols
                     .iter()
                     .zip(cells.iter())
@@ -448,76 +397,50 @@ impl Guest for RevenueCatFdw {
                         Some(Cell::String(s)) => Some(s.clone()),
                         _ => None,
                     })
-                    .ok_or(
-                        "'entitlement_id' column is required for granted_entitlements INSERT",
-                    )?;
-
-                // Optional expires_at (milliseconds epoch)
-                let expires_at = cols
-                    .iter()
-                    .zip(cells.iter())
-                    .find(|(name, _)| name.as_str() == "expires_at")
-                    .and_then(|(_, cell)| match cell {
-                        Some(Cell::Timestamp(v)) => Some(v / 1_000), // microseconds to ms
-                        Some(Cell::Timestamptz(v)) => Some(v / 1_000),
-                        Some(Cell::I64(v)) => Some(*v),
-                        _ => None,
-                    });
+                    .ok_or_else(|| "entitlement_id is required for granted_entitlements insert".to_owned())?;
 
                 let url = format!(
-                    "{}/projects/{}/customers/{}/actions/grant_entitlement",
-                    this.base_url, this.project_id, customer_id
+                    "{}/projects/{}/customers/{}/entitlements/{}/actions/grant",
+                    this.base_url, this.project_id, customer_id, entitlement_id
                 );
-
-                let mut body_map = JsonMap::new();
-                body_map.insert(
-                    "entitlement_id".to_owned(),
-                    JsonValue::String(entitlement_id),
-                );
-                if let Some(exp) = expires_at {
-                    body_map.insert("expires_at".to_owned(), JsonValue::Number(exp.into()));
-                }
-
-                let req = http::Request {
-                    method: http::Method::Post,
-                    url,
-                    headers: this.headers.clone(),
-                    body: JsonValue::Object(body_map).to_string(),
-                };
-                let resp = http::post(&req)?;
-                http::error_for_status(&resp)
-                    .map_err(|err| format!("{}: {}", err, resp.body))?;
-                stats::inc_stats(FDW_NAME, stats::Metric::RowsOut, 1);
+                // Body may include optional fields like expires_at
+                let body = this.row_to_body(row)?;
+                (url, body)
             }
-            _ => {
-                return Err(format!(
-                    "INSERT is not supported for object '{}'",
-                    this.object
-                ));
+            other => {
+                return Err(format!("insert not supported for {}", other));
             }
-        }
+        };
+
+        let req = http::Request {
+            method: http::Method::Post,
+            url,
+            headers: this.headers.clone(),
+            body,
+        };
+        let resp = http::post(&req)?;
+        http::error_for_status(&resp).map_err(|err| format!("{}: {}", err, resp.body))?;
 
         Ok(())
     }
 
     fn update(_ctx: &Context, _rowid: Cell, _row: &Row) -> FdwResult {
-        Err("UPDATE is not supported — RevenueCat API v2 has no general PATCH endpoints".to_owned())
+        Err("update not supported — use delete + insert instead".to_owned())
     }
 
     fn delete(_ctx: &Context, rowid: Cell) -> FdwResult {
         let this = Self::this_mut();
 
-        let id = match &rowid {
+        let rowid_str = match &rowid {
             Cell::String(s) => s.clone(),
-            _ => return Err("rowid must be a text column".to_owned()),
+            _ => return Err("rowid must be a string".to_owned()),
         };
 
         match this.object.as_str() {
-            "customers" => {
-                // DELETE /v2/projects/{pid}/customers/{id}
+            "customers" | "entitlements" | "offerings" => {
                 let url = format!(
-                    "{}/projects/{}/customers/{}",
-                    this.base_url, this.project_id, id
+                    "{}/projects/{}/{}/{}",
+                    this.base_url, this.project_id, this.object, rowid_str
                 );
                 let req = http::Request {
                     method: http::Method::Delete,
@@ -526,85 +449,34 @@ impl Guest for RevenueCatFdw {
                     body: String::default(),
                 };
                 let resp = http::delete(&req)?;
-                http::error_for_status(&resp)
-                    .map_err(|err| format!("{}: {}", err, resp.body))?;
-                stats::inc_stats(FDW_NAME, stats::Metric::RowsOut, 1);
-            }
-            "entitlements" => {
-                // DELETE /v2/projects/{pid}/entitlements/{id}
-                let url = format!(
-                    "{}/projects/{}/entitlements/{}",
-                    this.base_url, this.project_id, id
-                );
-                let req = http::Request {
-                    method: http::Method::Delete,
-                    url,
-                    headers: this.headers.clone(),
-                    body: String::default(),
-                };
-                let resp = http::delete(&req)?;
-                http::error_for_status(&resp)
-                    .map_err(|err| format!("{}: {}", err, resp.body))?;
-                stats::inc_stats(FDW_NAME, stats::Metric::RowsOut, 1);
-            }
-            "offerings" => {
-                // DELETE /v2/projects/{pid}/offerings/{id}
-                let url = format!(
-                    "{}/projects/{}/offerings/{}",
-                    this.base_url, this.project_id, id
-                );
-                let req = http::Request {
-                    method: http::Method::Delete,
-                    url,
-                    headers: this.headers.clone(),
-                    body: String::default(),
-                };
-                let resp = http::delete(&req)?;
-                http::error_for_status(&resp)
-                    .map_err(|err| format!("{}: {}", err, resp.body))?;
-                stats::inc_stats(FDW_NAME, stats::Metric::RowsOut, 1);
+                http::error_for_status(&resp).map_err(|err| format!("{}: {}", err, resp.body))?;
             }
             "granted_entitlements" => {
-                // Revoke a granted entitlement
-                // The rowid for granted_entitlements is a composite: "customer_id:entitlement_id"
-                // POST /v2/projects/{pid}/customers/{cid}/actions/revoke_granted_entitlement
-                let parts: Vec<&str> = id.splitn(2, ':').collect();
+                // rowid is "customer_id:entitlement_id"
+                let parts: Vec<&str> = rowid_str.splitn(2, ':').collect();
                 if parts.len() != 2 {
-                    return Err(
-                        "granted_entitlements rowid must be 'customer_id:entitlement_id'"
-                            .to_owned(),
-                    );
+                    return Err(format!(
+                        "granted_entitlements rowid must be 'customer_id:entitlement_id', got '{}'",
+                        rowid_str
+                    ));
                 }
-                let customer_id = parts[0];
-                let entitlement_id = parts[1];
+                let (customer_id, entitlement_id) = (parts[0], parts[1]);
 
                 let url = format!(
-                    "{}/projects/{}/customers/{}/actions/revoke_granted_entitlement",
-                    this.base_url, this.project_id, customer_id
+                    "{}/projects/{}/customers/{}/entitlements/{}/actions/revoke",
+                    this.base_url, this.project_id, customer_id, entitlement_id
                 );
-
-                let mut body_map = JsonMap::new();
-                body_map.insert(
-                    "entitlement_id".to_owned(),
-                    JsonValue::String(entitlement_id.to_owned()),
-                );
-
                 let req = http::Request {
                     method: http::Method::Post,
                     url,
                     headers: this.headers.clone(),
-                    body: JsonValue::Object(body_map).to_string(),
+                    body: String::default(),
                 };
                 let resp = http::post(&req)?;
-                http::error_for_status(&resp)
-                    .map_err(|err| format!("{}: {}", err, resp.body))?;
-                stats::inc_stats(FDW_NAME, stats::Metric::RowsOut, 1);
+                http::error_for_status(&resp).map_err(|err| format!("{}: {}", err, resp.body))?;
             }
-            _ => {
-                return Err(format!(
-                    "DELETE is not supported for object '{}'",
-                    this.object
-                ));
+            other => {
+                return Err(format!("delete not supported for {}", other));
             }
         }
 

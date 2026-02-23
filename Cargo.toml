@@ -17,6 +17,8 @@ serde_json = "1.0"
 [package.metadata.component]
 package = "wordpuppi:revenuecat-fdw"
 
+[package.metadata.component.dependencies]
+
 [package.metadata.component.target]
 path = "wit"
 

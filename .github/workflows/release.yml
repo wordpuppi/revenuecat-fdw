@@ -22,7 +22,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install cargo-component
-        run: cargo install cargo-component
+        run: cargo install cargo-component --locked --version 0.21.1
 
       - name: Build WASM binary
         run: cargo component build --release --target wasm32-unknown-unknown

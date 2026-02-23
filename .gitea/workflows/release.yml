@@ -24,7 +24,7 @@ jobs:
         shell: bash
         run: |
           source "$HOME/.cargo/env"
-          cargo install cargo-component
+          cargo install cargo-component --locked --version 0.21.1
 
       - name: Build WASM binary
         shell: bash
