@@ -2,6 +2,13 @@
 name = "revenuecat_fdw"
 version = "0.1.2"
 edition = "2021"
+description = "Query RevenueCat subscription data as native PostgreSQL tables via a WASM Foreign Data Wrapper"
+license = "MIT"
+repository = "https://github.com/wordpuppi/revenuecat-fdw"
+homepage = "https://github.com/wordpuppi/revenuecat-fdw"
+authors = ["Rick Penabella <ricalski@yahoo.com>"]
+keywords = ["supabase", "postgresql", "revenuecat", "fdw", "wasm"]
+categories = ["database"]
 
 [lib]
 crate-type = ["cdylib"]
