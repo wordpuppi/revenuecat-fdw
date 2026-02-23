@@ -42,9 +42,9 @@ select vault.create_secret('sk_xxx_your_revenuecat_v2_api_key', 'revenuecat', 'R
 create server revenuecat_server
   foreign data wrapper wasm_wrapper
   options (
-    fdw_package_url 'https://github.com/webpuppi/revenuecat-fdw/releases/download/v0.1.0/revenuecat_fdw.wasm',
+    fdw_package_url 'https://github.com/wordpuppi/revenuecat-fdw/releases/download/v0.1.1/revenuecat_fdw.wasm',
     fdw_package_name 'wordpuppi:revenuecat-fdw',
-    fdw_package_version '0.1.0',
+    fdw_package_version '0.1.1',
     fdw_package_checksum '<sha256-from-release>',
     api_url 'https://api.revenuecat.com/v2',
     project_id 'proj_your_project_id',
@@ -71,7 +71,7 @@ create foreign table revenuecat.customers (
 server revenuecat_server
 options (object 'customers', rowid_column 'id');
 
--- Subscriptions
+-- Subscriptions (customer-scoped: requires WHERE customer_id = '...')
 create foreign table revenuecat.subscriptions (
   id text,
   customer_id text,
@@ -90,7 +90,7 @@ create foreign table revenuecat.subscriptions (
 server revenuecat_server
 options (object 'subscriptions', rowid_column 'id');
 
--- Purchases (one-time)
+-- Purchases (customer-scoped: requires WHERE customer_id = '...')
 create foreign table revenuecat.purchases (
   id text,
   customer_id text,
@@ -146,9 +146,10 @@ options (object 'offerings', rowid_column 'id');
 
 -- Granted entitlements (write-only: grant/revoke)
 create foreign table revenuecat.granted_entitlements (
-  customer_id text,
+  id             text,       -- composite: "customer_id:entitlement_id"
+  customer_id    text,
   entitlement_id text,
-  expires_at timestamp
+  expires_at     timestamp
 )
 server revenuecat_server
 options (object 'granted_entitlements', rowid_column 'id');
@@ -156,13 +157,18 @@ options (object 'granted_entitlements', rowid_column 'id');
 
 ## Query Examples
 
-### Active subscriptions with customer info
+### Customer subscriptions (customer-scoped)
+
+> **Note:** Subscriptions and purchases are customer-scoped. You must filter by `customer_id`:
+> ```sql
+> SELECT * FROM revenuecat.subscriptions WHERE customer_id = 'cust123';
+> ```
+> Unfiltered `SELECT *` is not supported by the RevenueCat API.
 
 ```sql
-select c.id, s.status, s.product_id, s.current_period_ends_at
-from revenuecat.customers c
-join revenuecat.subscriptions s on c.id = s.customer_id
-where s.status = 'active';
+select id, status, product_id, current_period_ends_at
+from revenuecat.subscriptions
+where customer_id = 'user_12345';
 ```
 
 ### Single customer lookup (uses ID pushdown — 1 API call)
@@ -178,7 +184,8 @@ select
   id,
   attrs->'total_revenue_in_usd'->>'gross' as revenue_gross,
   attrs->'total_revenue_in_usd'->>'currency' as currency
-from revenuecat.subscriptions;
+from revenuecat.subscriptions
+where customer_id = 'user_12345';
 ```
 
 ### Create a customer
@@ -211,19 +218,13 @@ delete from revenuecat.customers where id = 'wpp_new_customer';
 ### Materialized view for analytics
 
 ```sql
-create materialized view revenuecat.active_subscribers as
-select
-  s.customer_id,
-  s.product_id,
-  s.status,
-  s.current_period_ends_at,
-  s.store,
-  s.attrs->'total_revenue_in_usd'->>'gross' as revenue_usd
-from revenuecat.subscriptions s
-where s.gives_access = true;
+-- Products are bulk-listable (no customer_id filter needed)
+create materialized view revenuecat.products_cache as
+select id, store_identifier, display_name, type, attrs
+from revenuecat.products;
 
--- Refresh periodically (respects rate limits)
-refresh materialized view revenuecat.active_subscribers;
+-- Refresh periodically (respects rate limits — 60 req/min for products)
+refresh materialized view revenuecat.products_cache;
 ```
 
 ## Rate Limits

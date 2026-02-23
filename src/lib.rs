@@ -94,7 +94,30 @@ impl RevenueCatFdw {
 
             match pushdown_id {
                 Some(id) => self.item_url(&self.object, &id),
-                None => self.list_url(&self.object),
+                None => {
+                    // subscriptions and purchases are customer-scoped — no project-level list
+                    if matches!(self.object.as_str(), "subscriptions" | "purchases") {
+                        let customer_id = quals
+                            .iter()
+                            .find(|q| q.field() == "customer_id")
+                            .and_then(|q| match q.value() {
+                                Value::Cell(Cell::String(s)) => Some(s),
+                                _ => None,
+                            })
+                            .ok_or_else(|| {
+                                format!(
+                                    "{} requires a WHERE customer_id = '...' filter",
+                                    self.object
+                                )
+                            })?;
+                        format!(
+                            "{}/projects/{}/customers/{}/{}?limit=100",
+                            self.base_url, self.project_id, customer_id, self.object
+                        )
+                    } else {
+                        self.list_url(&self.object)
+                    }
+                }
             }
         };
 
