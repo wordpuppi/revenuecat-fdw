@@ -24,8 +24,34 @@ struct RevenueCatFdw {
     rowid_col: String,
 }
 
+// ponytail: single global instance is the official Supabase Wrappers WASM FDW
+// template pattern — the host instantiates one FDW per query, so this is safe
+// across separate queries. Known ceiling: a single query that JOINs two
+// RevenueCat foreign tables would share (and corrupt) this one instance.
+// Upgrade path: thread per-scan state through the host handle if intra-query
+// joins across two RC tables are ever needed. See README "Concurrency".
 static mut INSTANCE: *mut RevenueCatFdw = std::ptr::null_mut::<RevenueCatFdw>();
 static FDW_NAME: &str = "RevenueCatFdw";
+
+/// RevenueCat's single-item and customer-scoped endpoints can only express
+/// equality, so only `=` quals may be pushed down to the API. Every other
+/// operator (`!=`, `<>`, `>`, `LIKE`/`~~`, ...) must be left for Postgres to
+/// evaluate against the full result set — pushing a non-`=` qual down as
+/// equality would silently return the wrong rows.
+const fn op_is_eq(operator: &str) -> bool {
+    matches!(operator.as_bytes(), [b'='])
+}
+
+// Compile-time guard, verified by `cargo check --target wasm32-unknown-unknown`
+// (this crate is a wasm cdylib with no host test runner): only `=` is a
+// pushdown-eligible operator.
+const _: () = {
+    assert!(op_is_eq("="));
+    assert!(!op_is_eq("!="));
+    assert!(!op_is_eq("<>"));
+    assert!(!op_is_eq(">"));
+    assert!(!op_is_eq("~~")); // Postgres LIKE
+};
 
 impl RevenueCatFdw {
     fn init_instance() {
@@ -72,6 +98,12 @@ impl RevenueCatFdw {
     fn make_request(&mut self, ctx: &Context) -> FdwResult {
         let quals = ctx.get_quals();
 
+        // Whether this request targets a single-item GET-by-id endpoint. A 404
+        // is only "not found -> empty result" for single-item lookups; a 404 on
+        // a list endpoint means a wrong project_id/customer_id and must surface
+        // as an error (see the 404 handling below).
+        let mut is_single_item = false;
+
         let url = if let Some(ref url) = self.url {
             // Pagination: use the stored next_page URL
             if url.starts_with("http") {
@@ -81,25 +113,36 @@ impl RevenueCatFdw {
                 format!("https://api.revenuecat.com{}", url)
             }
         } else {
-            // First request: check for ID pushdown
-            let pushdown_id = quals.iter().find(|q| q.field() == "id").and_then(|q| {
-                if !self.can_pushdown_id() {
-                    return None;
-                }
-                match q.value() {
-                    Value::Cell(Cell::String(s)) => Some(s),
-                    _ => None,
-                }
-            });
+            // First request: check for ID pushdown. Only push down a `=` qual —
+            // the single-item endpoint can only express equality, so `!=`, `>`,
+            // `LIKE`, etc. must fall through to a list scan for Postgres to
+            // filter (pushing them down as equality returns the wrong rows).
+            let pushdown_id = quals
+                .iter()
+                .find(|q| q.field() == "id" && op_is_eq(&q.operator()))
+                .and_then(|q| {
+                    if !self.can_pushdown_id() {
+                        return None;
+                    }
+                    match q.value() {
+                        Value::Cell(Cell::String(s)) => Some(s),
+                        _ => None,
+                    }
+                });
 
             match pushdown_id {
-                Some(id) => self.item_url(&self.object, &id),
+                Some(id) => {
+                    is_single_item = true;
+                    self.item_url(&self.object, &id)
+                }
                 None => {
                     // subscriptions and purchases are customer-scoped — no project-level list
                     if matches!(self.object.as_str(), "subscriptions" | "purchases") {
+                        // Same rule: only a `=` filter can be pushed down to the
+                        // customer-scoped endpoint.
                         let customer_id = quals
                             .iter()
-                            .find(|q| q.field() == "customer_id")
+                            .find(|q| q.field() == "customer_id" && op_is_eq(&q.operator()))
                             .and_then(|q| match q.value() {
                                 Value::Cell(Cell::String(s)) => Some(s),
                                 _ => None,
@@ -131,8 +174,12 @@ impl RevenueCatFdw {
 
         let resp_json: JsonValue = serde_json::from_str(&resp.body).map_err(|e| e.to_string())?;
 
-        // Handle 404 — resource not found is not an error, just empty results
-        if resp.status_code == 404 {
+        // Handle 404 for SINGLE-ITEM lookups only: a missing item is an empty
+        // result set, not an error. A 404 on a LIST endpoint (project- or
+        // customer-scoped) means a wrong project_id/customer_id and must NOT be
+        // swallowed — let error_for_status surface it below so the operator
+        // sees the misconfiguration instead of a silent empty table.
+        if resp.status_code == 404 && is_single_item {
             let is_not_found = resp_json
                 .get("type")
                 .and_then(|v| v.as_str())
@@ -340,17 +387,20 @@ impl Guest for RevenueCatFdw {
             stats::inc_stats(FDW_NAME, stats::Metric::RowsIn, this.src_rows.len() as i64);
             stats::inc_stats(FDW_NAME, stats::Metric::RowsOut, this.src_rows.len() as i64);
 
-            // No more pages — scan complete
-            if this.url.is_none() {
-                return Ok(None);
-            }
-
-            // Fetch next page
-            this.make_request(ctx)?;
-
-            // If next page returned no rows, we're done
-            if this.src_rows.is_empty() {
-                return Ok(None);
+            // Advance through pages until we have rows or the cursor is
+            // exhausted. An empty intermediate page can still carry a next_page
+            // cursor, so an empty page must ADVANCE the scan — the only valid
+            // terminator is the absence of a next_page URL. (Previously an empty
+            // intermediate page ended the scan early and silently dropped every
+            // later page.)
+            loop {
+                if this.url.is_none() {
+                    return Ok(None);
+                }
+                this.make_request(ctx)?;
+                if !this.src_rows.is_empty() {
+                    break;
+                }
             }
         }
 
@@ -512,3 +562,20 @@ impl Guest for RevenueCatFdw {
 }
 
 bindings::export!(RevenueCatFdw with_types_in bindings);
+
+#[cfg(test)]
+mod tests {
+    use super::op_is_eq;
+
+    // Pushdown guard: only `=` may be pushed down to RevenueCat's single-item /
+    // customer-scoped endpoints; every other operator must fall through to a
+    // full list scan for Postgres to filter. (This test links only on a host
+    // target; the wasm cdylib build relies on the `const _` assertion above.)
+    #[test]
+    fn only_equality_is_pushed_down() {
+        assert!(op_is_eq("="));
+        for op in ["!=", "<>", ">", "<", ">=", "<=", "~~", "LIKE", "IN", "", "=="] {
+            assert!(!op_is_eq(op), "operator {op:?} must not be pushed down");
+        }
+    }
+}

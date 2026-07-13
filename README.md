@@ -203,6 +203,12 @@ values ('wpp_new_customer', 'entla1b2c3d4e5', '2027-01-01'::timestamp);
 
 ### Revoke a granted entitlement
 
+> **This does NOT cancel a paid subscription.** Revoking only removes a *manually
+> granted* entitlement (a promo/comp grant). A customer with a purchased
+> subscription keeps access **and keeps being charged** — the store subscription
+> is untouched. To actually stop billing, cancel the subscription via the
+> RevenueCat v2 cancel endpoint (see [Cancelling a paid subscription](#cancelling-a-paid-subscription)).
+
 ```sql
 -- rowid is composite: 'customer_id:entitlement_id'
 delete from revenuecat.granted_entitlements
@@ -211,9 +217,27 @@ where id = 'wpp_new_customer:entla1b2c3d4e5';
 
 ### Delete a customer
 
+> **Destructive and irreversible — and it does NOT stop billing.** Deleting a
+> customer wipes the customer record and all of their history at RevenueCat;
+> their active store subscription still renews and charges. A loose `WHERE` would
+> enumerate and wipe many customers at once. For this reason `setup.sql` revokes
+> `INSERT`/`DELETE` on `revenuecat.customers` from the app roles — this runs only
+> as the FDW owner (postgres/superuser). To end billing, cancel the subscription
+> (below); never delete the customer to "cancel".
+
 ```sql
 delete from revenuecat.customers where id = 'wpp_new_customer';
 ```
+
+### Cancelling a paid subscription
+
+Neither revoking an entitlement nor deleting a customer cancels a purchased
+subscription — both leave the store subscription active and charging. Cancellation
+is **not** an FDW/SQL operation. Cancel through the RevenueCat v2 cancel endpoint
+(`POST /projects/{project_id}/subscriptions/{subscription_id}/actions/cancel`),
+which WordPuppi wraps as `cancel_customer_subscriptions`. That path keeps the
+secret API key server-side and requires a key with the
+`customer_information:subscriptions:read_write` scope.
 
 ### Materialized view for analytics
 
@@ -254,6 +278,19 @@ cargo component build --release --target wasm32-unknown-unknown
 ## How RevenueCat Timestamps Work
 
 RevenueCat API v2 uses **millisecond epoch integers** for all timestamp fields (e.g., `first_seen_at: 1658399423658`). The FDW automatically converts these to PostgreSQL `timestamp` values. The `attrs jsonb` column always contains the raw millisecond values.
+
+## Concurrency
+
+This FDW keeps its scan state in a single global instance (`static mut INSTANCE`),
+which is the official Supabase Wrappers WASM FDW template pattern. The host
+instantiates one FDW per query, so this is safe **across separate queries**.
+
+Known ceiling: a **single query that JOINs two RevenueCat foreign tables** (e.g.
+`customers` JOIN `subscriptions` in one statement) would have both scans share —
+and corrupt — the one global instance. Query the tables separately (or stage one
+side into a table/materialized view) if you need to combine them. Upgrade path:
+thread per-scan state through the host handle if intra-query joins across two RC
+tables ever become a requirement.
 
 ## License
 

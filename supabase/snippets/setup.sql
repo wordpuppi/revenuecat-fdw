@@ -52,6 +52,8 @@ create schema if not exists revenuecat;
 -- Customers
 -- Supports: SELECT, INSERT (create customer), DELETE (delete customer)
 -- ID pushdown: WHERE id = 'xxx' uses single-object endpoint (1 API call)
+-- WARNING: DELETE here maps to an IRREVERSIBLE RevenueCat customer wipe and does
+-- NOT stop billing — see the REVOKE guard rail immediately below.
 create foreign table revenuecat.customers (
   id                    text,
   project_id            text,
@@ -64,6 +66,26 @@ create foreign table revenuecat.customers (
 )
 server revenuecat_server
 options (object 'customers', rowid_column 'id');
+
+-- ------------------------------------------------------------
+-- Guard rail: revoke destructive writes on customers from app roles
+-- ------------------------------------------------------------
+-- `DELETE FROM revenuecat.customers` maps to `DELETE /projects/{p}/customers/{id}`
+-- — an IRREVERSIBLE wipe of the customer and all their history — and it does NOT
+-- stop billing: a loose WHERE would enumerate and wipe many customers while
+-- their paid subscriptions keep charging. Creating/deleting RevenueCat customers
+-- from SQL is not an application operation, so revoke INSERT/DELETE from every
+-- app-facing role (and PUBLIC). Cancel paid subscriptions via the RevenueCat v2
+-- cancel endpoint instead (see the app's cancel_customer_subscriptions), never
+-- by deleting the customer or revoking an entitlement.
+--
+-- The FDW owner (the postgres/superuser that ran this script) keeps full control
+-- for deliberate admin use. Idempotent: REVOKE of an unheld privilege is a no-op.
+-- NOTE: this script establishes no custom app role, so the guard targets the
+-- standard Supabase app roles; if your app connects as a different role, add it
+-- to the list below.
+revoke insert, delete on revenuecat.customers from anon, authenticated, service_role;
+revoke insert, delete on revenuecat.customers from public;
 
 -- Subscriptions (customer-scoped)
 -- Supports: SELECT only
