@@ -42,10 +42,10 @@ select vault.create_secret('sk_xxx_your_revenuecat_v2_api_key', 'revenuecat', 'R
 create server revenuecat_server
   foreign data wrapper wasm_wrapper
   options (
-    fdw_package_url 'https://github.com/wordpuppi/revenuecat-fdw/releases/download/v0.1.1/revenuecat_fdw.wasm',
+    fdw_package_url 'https://github.com/wordpuppi/revenuecat-fdw/releases/download/v0.1.3/revenuecat_fdw.wasm',
     fdw_package_name 'wordpuppi:revenuecat-fdw',
-    fdw_package_version '0.1.1',
-    fdw_package_checksum '<sha256-from-release>',
+    fdw_package_version '0.1.3',
+    fdw_package_checksum '58f9075d98e22bd9ca198c931dbbb3d00c2b29798750013958dbf61e317db4c1',
     api_url 'https://api.revenuecat.com/v2',
     project_id 'proj_your_project_id',
     api_key_id '<vault-secret-uuid>'
@@ -72,19 +72,29 @@ server revenuecat_server
 options (object 'customers', rowid_column 'id');
 
 -- Subscriptions (customer-scoped: requires WHERE customer_id = '...')
+-- Columns are the full scalar surface of API v2.0.0 (2026-07); attrs = raw row.
 create foreign table revenuecat.subscriptions (
-  id text,
+  id text,                            -- RC-internal id (sub...) — NOT the store id
   customer_id text,
+  original_customer_id text,
   product_id text,
   status text,
   auto_renewal_status text,
   gives_access boolean,
+  pending_payment boolean,
   starts_at timestamp,
   current_period_starts_at timestamp,
   current_period_ends_at timestamp,
+  ends_at timestamp,
   environment text,
   store text,
+  store_subscription_identifier text, -- the STORE's subscription/transaction id
   country text,
+  management_url text,
+  presented_offering_id text,
+  ownership text,                     -- purchased | family_shared
+  pending_changes jsonb,
+  total_revenue_in_usd jsonb,         -- MonetaryAmount {currency, gross, tax, proceeds, commission}
   attrs jsonb
 )
 server revenuecat_server
@@ -94,13 +104,18 @@ options (object 'subscriptions', rowid_column 'id');
 create foreign table revenuecat.purchases (
   id text,
   customer_id text,
+  original_customer_id text,
   product_id text,
   purchased_at timestamp,
   quantity int,
   status text,
   environment text,
   store text,
+  store_purchase_identifier text,
   country text,
+  presented_offering_id text,
+  ownership text,
+  revenue_in_usd jsonb,               -- MonetaryAmount; key differs from subscriptions'
   attrs jsonb
 )
 server revenuecat_server
@@ -177,16 +192,42 @@ where customer_id = 'user_12345';
 select * from revenuecat.customers where id = 'user_12345';
 ```
 
-### Revenue from the full response JSON
+### Revenue per subscription
+
+`total_revenue_in_usd` is a nested MonetaryAmount object, so it is a `jsonb`
+column — extract fields with `->>`:
 
 ```sql
 select
   id,
-  attrs->'total_revenue_in_usd'->>'gross' as revenue_gross,
-  attrs->'total_revenue_in_usd'->>'currency' as currency
+  total_revenue_in_usd->>'gross' as revenue_gross,
+  total_revenue_in_usd->>'currency' as currency
 from revenuecat.subscriptions
 where customer_id = 'user_12345';
 ```
+
+One-time purchases carry the same shape under a **different key**: `revenue_in_usd`.
+
+### Joining to your own users table
+
+`subscriptions.id` is RevenueCat's internal id (`sub...`). If your app stores the
+id it got from RC **webhooks** (`original_transaction_id`), that is the STORE's
+id — join on `store_subscription_identifier`, not `id`:
+
+```sql
+select u.email, s.status, s.total_revenue_in_usd->>'gross' as gross
+from users u
+join revenuecat.subscriptions s
+  on s.store_subscription_identifier = u.subscription_id
+where s.customer_id = u.pid;  -- customer_id filter still required
+```
+
+### Anything not declared as a column
+
+`attrs` always carries the complete raw API row. Gotcha: raw timestamps in
+`attrs` are **millisecond epochs** — cast with
+`to_timestamp((attrs->>'starts_at')::bigint / 1000)`; a naive `::timestamp`
+cast lands in year ~56000. Declared `timestamp` columns are converted for you.
 
 ### Create a customer
 

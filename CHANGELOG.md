@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+Schema drift catch-up against the live v2 API (v2.0.0 spec, 2026-07) — DDL/docs
+only, no wasm change (the generic column mapper resolves any same-named
+top-level field):
+
+- `subscriptions`: declare the 9 fields the API returns that were previously
+  reachable only via `attrs` — `store_subscription_identifier` (the store's id,
+  the join key to app-side webhook-stamped ids), `total_revenue_in_usd` (jsonb
+  MonetaryAmount — the money figure), `ends_at`, `management_url`,
+  `original_customer_id`, `presented_offering_id`, `ownership`,
+  `pending_payment`, `pending_changes`.
+- `purchases`: declare `revenue_in_usd` (jsonb MonetaryAmount — note the key
+  differs from subscriptions'), `store_purchase_identifier`,
+  `original_customer_id`, `presented_offering_id`, `ownership`.
+- setup.sql / README now pin the v0.1.3 wasm (url + version + real sha256 —
+  both previously pinned v0.1.1, so the 0.1.3 correctness fixes were never
+  deployed), and document the store-id join and the attrs ms-epoch footgun.
+
 ## [0.1.3] - 2026-07-13
 
 Correctness hardening (AB#403 / AB#401):

@@ -9,8 +9,9 @@
 -- Steps:
 --   1. Replace 'sk_xxx_your_revenuecat_v2_api_key' with your actual key
 --   2. Replace 'proj_your_project_id' with your RevenueCat project ID
---   3. After CREATE SERVER, replace '<sha256-from-release>' with the checksum from
---      https://github.com/webpuppi/revenuecat-fdw/releases/tag/v0.1.0
+--   3. The server pins the v0.1.3 wasm by sha256; if you pin a different release,
+--      update url/version/checksum together from
+--      https://github.com/wordpuppi/revenuecat-fdw/releases
 --   4. Run the full script
 
 -- ============================================================
@@ -34,10 +35,10 @@ select vault.create_secret(
 create server revenuecat_server
   foreign data wrapper wasm_wrapper
   options (
-    fdw_package_url     'https://github.com/wordpuppi/revenuecat-fdw/releases/download/v0.1.1/revenuecat_fdw.wasm',
+    fdw_package_url     'https://github.com/wordpuppi/revenuecat-fdw/releases/download/v0.1.3/revenuecat_fdw.wasm',
     fdw_package_name    'wordpuppi:revenuecat-fdw',
-    fdw_package_version '0.1.1',
-    fdw_package_checksum '<sha256-from-release>',
+    fdw_package_version '0.1.3',
+    fdw_package_checksum '58f9075d98e22bd9ca198c931dbbb3d00c2b29798750013958dbf61e317db4c1',
     api_url             'https://api.revenuecat.com/v2',
     project_id          'proj_your_project_id',
     api_key_id          '<vault-secret-uuid>'
@@ -91,20 +92,30 @@ revoke insert, delete on revenuecat.customers from public;
 -- Supports: SELECT only
 -- IMPORTANT: Requires WHERE customer_id = '...' filter (no bulk list endpoint)
 -- ID pushdown: WHERE id = 'xxx' also supported
+-- Columns are the full scalar surface of API v2.0.0 (2026-07); attrs = raw row.
 create foreign table revenuecat.subscriptions (
-  id                         text,
-  customer_id                text,
-  product_id                 text,
-  status                     text,    -- active | expired | in_trial | in_grace_period | ...
-  auto_renewal_status        text,    -- will_renew | will_not_renew | ...
-  gives_access               boolean,
-  starts_at                  timestamp,
-  current_period_starts_at   timestamp,
-  current_period_ends_at     timestamp,
-  environment                text,    -- production | sandbox
-  store                      text,    -- app_store | play_store | stripe | ...
-  country                    text,
-  attrs                      jsonb
+  id                            text,       -- RC-internal id (sub...) — NOT the store id
+  customer_id                   text,
+  original_customer_id          text,       -- pre-transfer owner
+  product_id                    text,
+  status                        text,       -- active | expired | trialing | in_grace_period | ...
+  auto_renewal_status           text,       -- will_renew | will_not_renew | ...
+  gives_access                  boolean,
+  pending_payment               boolean,    -- charge not yet settled
+  starts_at                     timestamp,
+  current_period_starts_at      timestamp,
+  current_period_ends_at        timestamp,
+  ends_at                       timestamp,  -- definitive termination (refund/cancel)
+  environment                   text,       -- production | sandbox
+  store                         text,       -- app_store | play_store | stripe | rc_billing | ...
+  store_subscription_identifier text,       -- the STORE's subscription/transaction id
+  country                       text,
+  management_url                text,       -- customer manage/cancel portal
+  presented_offering_id         text,
+  ownership                     text,       -- purchased | family_shared
+  pending_changes               jsonb,      -- scheduled plan change at period end
+  total_revenue_in_usd          jsonb,      -- MonetaryAmount {currency, gross, tax, proceeds, commission}
+  attrs                         jsonb
 )
 server revenuecat_server
 options (object 'subscriptions', rowid_column 'id');
@@ -114,16 +125,21 @@ options (object 'subscriptions', rowid_column 'id');
 -- IMPORTANT: Requires WHERE customer_id = '...' filter (no bulk list endpoint)
 -- ID pushdown: WHERE id = 'xxx' also supported
 create foreign table revenuecat.purchases (
-  id           text,
-  customer_id  text,
-  product_id   text,
-  purchased_at timestamp,
-  quantity     int,
-  status       text,
-  environment  text,
-  store        text,
-  country      text,
-  attrs        jsonb
+  id                        text,
+  customer_id               text,
+  original_customer_id      text,
+  product_id                text,
+  purchased_at              timestamp,
+  quantity                  int,
+  status                    text,
+  environment               text,
+  store                     text,
+  store_purchase_identifier text,
+  country                   text,
+  presented_offering_id     text,
+  ownership                 text,       -- purchased | family_shared
+  revenue_in_usd            jsonb,      -- MonetaryAmount; note: key differs from subscriptions'
+  attrs                     jsonb
 )
 server revenuecat_server
 options (object 'purchases', rowid_column 'id');
